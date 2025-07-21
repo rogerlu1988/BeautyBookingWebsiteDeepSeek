@@ -1,1 +1,6 @@
 .env
+# Example additional entries
+node_modules/
+*.log
+.DS_Store
+/Backend/uploads/

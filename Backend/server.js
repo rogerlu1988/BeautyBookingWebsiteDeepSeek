@@ -1,54 +1,146 @@
 const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
+const apiRouter = express.Router();
 const port = process.env.PORT || 5000;
 
 // Middleware
-app.use(express.json());
+app.use(cors()); // Enable CORS for all routes
+app.use(express.json()); // Parse JSON request bodies
 
-// Database connection
+// Database connection setup
 let db;
 async function connectDB() {
-  const client = new MongoClient(process.env.MONGODB_URI);
-  await client.connect();
-  db = client.db();
-  console.log('✅ MongoDB connected');
+  try {
+    const client = new MongoClient(process.env.MONGODB_URI);
+    await client.connect();
+    db = client.db();
+    console.log('✅ MongoDB connected');
+  } catch (error) {
+    console.error('❌ MongoDB connection failed:', error);
+    process.exit(1); // Exit if DB connection fails
+  }
 }
 
-// Routes
-app.get('/', (req, res) => {
-  res.send('Beauty Booking API is running!');
-});
-
-// User creation endpoint
-app.post('/users', async (req, res) => {
+// Authorization Middleware
+const authenticate = (req, res, next) => {
+  // Get token from Authorization header
+  const authHeader = req.headers.authorization;
+  
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: "Unauthorized: No token provided" });
+  }
+  
+  const token = authHeader.split(' ')[1];
+  
   try {
-    const user = req.body;
+    // Verify token using JWT secret
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded; // Attach user data to request object
+    next(); // Proceed to next middleware/route
+  } catch (error) {
+    console.error("JWT verification error:", error);
+    return res.status(401).json({ error: "Unauthorized: Invalid token" });
+  }
+};
+
+// ===== Routes ===== //
+
+// Mount API Router
+app.use('/api/auth', apiRouter);
+
+// Auth Routes
+apiRouter.post('/register', async (req, res) => {
+  try {
+    const { name, email, password, phone } = req.body;
     
     // Basic validation
-    if (!user.name || !user.email) {
-      return res.status(400).json({ error: "Name and email are required" });
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: "Name, email, and password are required" });
     }
     
-    // Insert into users collection
-    const result = await db.collection('users').insertOne(user);
+    // Check if user already exists
+    const existingUser = await db.collection('users').findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ error: "User already exists" });
+    }
+    
+    // Hash password
+    const salt = bcrypt.genSaltSync(10);
+    const hashedPassword = bcrypt.hashSync(password, salt);
+    
+    // Create new user
+    const newUser = {
+      name,
+      email,
+      password: hashedPassword,
+      phone: phone || '',
+      createdAt: new Date()
+    };
+    
+    const result = await db.collection('users').insertOne(newUser);
     
     res.status(201).json({
-      message: "User created successfully",
+      message: "User registered successfully",
       userId: result.insertedId
     });
   } catch (error) {
-    console.error("Error creating user:", error);
+    console.error("Registration error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// GET ALL USERS ENDPOINT - MAKE SURE THIS EXISTS
-app.get('/users', async (req, res) => {
+apiRouter.post('/login', async (req, res) => {
   try {
-    const users = await db.collection('users').find().toArray();
+    const { email, password } = req.body;
+    
+    // Find user by email
+    const user = await db.collection('users').findOne({ email });
+    
+    // Validate credentials
+    if (!user || !bcrypt.compareSync(password, user.password)) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+    
+    // Create JWT token
+    const token = jwt.sign(
+      { 
+        userId: user._id, 
+        email: user.email,
+        name: user.name
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' } // Token expires in 1 hour
+    );
+    
+    res.json({ 
+      message: "Login successful",
+      token,
+      userId: user._id,
+      name: user.name,
+      email: user.email
+    });
+  } catch (error) {
+    console.error("Login error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.send('Beauty Booking API is running!');
+});
+
+// Get all users (Protected)
+app.get('/users', authenticate, async (req, res) => {
+  try {
+    // Get users but exclude passwords
+    const users = await db.collection('users').find({}, { projection: { password: 0 } }).toArray();
     res.json(users);
   } catch (error) {
     console.error("Error fetching users:", error);
@@ -56,11 +148,21 @@ app.get('/users', async (req, res) => {
   }
 });
 
-// GET SINGLE USER BY ID ENDPOINT - MAKE SURE THIS EXISTS
-app.get('/users/:id', async (req, res) => {
+// Get single user by ID (Protected)
+app.get('/users/:id', authenticate, async (req, res) => {
   try {
     const userId = req.params.id;
-    const user = await db.collection('users').findOne({ _id: new ObjectId(userId) });
+    
+    // Validate ID format
+    if (!ObjectId.isValid(userId)) {
+      return res.status(400).json({ error: "Invalid user ID format" });
+    }
+    
+    // Find user but exclude password
+    const user = await db.collection('users').findOne(
+      { _id: new ObjectId(userId) },
+      { projection: { password: 0 } }
+    );
     
     if (!user) {
       return res.status(404).json({ error: "User not found" });
@@ -73,8 +175,74 @@ app.get('/users/:id', async (req, res) => {
   }
 });
 
+// Create appointment (Protected)
+app.post('/appointments', authenticate, async (req, res) => {
+  try {
+    const { service, date, notes } = req.body;
+    const userId = req.user.userId; // From authenticated user
+    
+    // Validation
+    if (!service || !date) {
+      return res.status(400).json({ error: "Service and date are required" });
+    }
+    
+    // Create appointment object
+    const newAppointment = {
+      userId: new ObjectId(userId),
+      service,
+      date: new Date(date),
+      notes: notes || '',
+      status: 'booked',
+      createdAt: new Date()
+    };
+    
+    const result = await db.collection('appointments').insertOne(newAppointment);
+    
+    res.status(201).json({
+      message: "Appointment created successfully",
+      appointmentId: result.insertedId
+    });
+  } catch (error) {
+    console.error("Error creating appointment:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get appointments for current user (Protected)
+app.get('/appointments', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.userId; // From authenticated user
+    
+    const appointments = await db.collection('appointments')
+      .find({ userId: new ObjectId(userId) })
+      .sort({ date: 1 }) // Sort by date ascending
+      .toArray();
+    
+    res.json(appointments);
+  } catch (error) {
+    console.error("Error fetching appointments:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Error handling middleware - Must be last!
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: 'Something went wrong!' });
+});
+
+// 404 Handler - Must be last route!
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint not found' });
+});
+
 // Start server
 app.listen(port, async () => {
-  await connectDB();
-  console.log(`Server running on port ${port}`);
+  try {
+    await connectDB();
+    console.log(`Server running on port ${port}`);
+  } catch (error) {
+    console.error("Failed to connect to MongoDB", error);
+    process.exit(1);
+  }
 });
