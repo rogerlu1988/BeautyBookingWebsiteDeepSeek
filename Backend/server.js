@@ -2,16 +2,25 @@ const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
-const apiRouter = express.Router();
 const port = process.env.PORT || 5000;
 
-// Middleware
-app.use(cors()); // Enable CORS for all routes
-app.use(express.json()); // Parse JSON request bodies
+// CORS middleware
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', 'http://localhost:8000');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
+// Parse JSON bodies
+app.use(express.json());
 
 // Database connection setup
 let db;
@@ -51,28 +60,25 @@ const authenticate = (req, res, next) => {
 
 // ===== Routes ===== //
 
-// Mount API Router
-app.use('/api/auth', apiRouter);
-
-// Auth Routes
-apiRouter.post('/register', async (req, res) => {
+// Register endpoint
+app.post('/api/auth/register', async (req, res) => {
   try {
     const { name, email, password, phone } = req.body;
     
     // Basic validation
     if (!name || !email || !password) {
-      return res.status(400).json({ error: "Name, email, and password are required" });
+      return res.status(400).json({ error: 'Name, email, and password are required' });
     }
     
-    // Check if user already exists
+    // Check if user exists
     const existingUser = await db.collection('users').findOne({ email });
     if (existingUser) {
-      return res.status(400).json({ error: "User already exists" });
+      return res.status(400).json({ error: 'User already exists' });
     }
     
     // Hash password
-    const salt = bcrypt.genSaltSync(10);
-    const hashedPassword = bcrypt.hashSync(password, salt);
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
     
     // Create new user
     const newUser = {
@@ -85,15 +91,24 @@ apiRouter.post('/register', async (req, res) => {
     
     const result = await db.collection('users').insertOne(newUser);
     
+    // Create JWT token
+    const token = jwt.sign(
+      { userId: result.insertedId },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+    
     res.status(201).json({
-      message: "User registered successfully",
-      userId: result.insertedId
+      message: 'User registered successfully',
+      token
     });
   } catch (error) {
-    console.error("Registration error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    console.error('Registration error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+
 
 apiRouter.post('/login', async (req, res) => {
   try {
